@@ -71,6 +71,15 @@ class JoinResult:
     window_end: float
     left_record: dict[str, Any]
     right_record: dict[str, Any] | None
+    # 同一关联键在同一窗口内的全部合格事件：聚合统计按这些事件计数，
+    # left_record/right_record 保留其中第一条用于单条展示。
+    left_events: list[dict[str, Any]] = field(default_factory=list)
+    right_events: list[dict[str, Any]] = field(default_factory=list)
+    pair_count: int = 0
+
+    @property
+    def event_count(self) -> int:
+        return len(self.left_events) + len(self.right_events)
 
 
 # ---------------------------------------------------------------------------
@@ -79,12 +88,19 @@ class JoinResult:
 
 # ---- 链路1: stream_source → calc_operator → window_config → sliding_index → sink_output ----
 
-def simulate_stream_batch(source_name: str, batch_size: int = 10) -> list[dict[str, Any]]:
-    """模拟从流式源端拉取一批事件数据。"""
+def simulate_stream_batch(
+    source_name: str, batch_size: int = 10, base_ts: float | None = None,
+) -> list[dict[str, Any]]:
+    """模拟从流式源端拉取一批事件数据。
+
+    base_ts 可显式指定批次起点，用于重复读取同一个已提交窗口（保证幂等）；
+    不指定时按当前时间生成。
+    """
     rows = store.rows("stream_source")
     source = next((r for r in rows if r.get("源端名称") == source_name), None)
     events = []
-    base_ts = time.time()
+    if base_ts is None:
+        base_ts = time.time()
     # 测试用源端名称直接生成模拟事件
     if source is None:
         for i in range(batch_size):
@@ -261,35 +277,48 @@ def perform_stream_join(
     window_sec: float,
     join_type: str = "inner",
 ) -> list[JoinResult]:
-    """执行双流时间窗口关联。"""
+    """执行双流时间窗口关联。
+
+    先按"窗口 + 关联键"分组，键内保留所有合格事件；同一用户在同一窗口内
+    有多条事件时，所有左流事件与所有右流事件两两配对，不再用字典把先到
+    的记录覆盖掉。内关联只输出两侧都非空的键，左/右关联保留单边事件。
+    """
+    from app.services.join_stream import group_window_events
+
+    groups = group_window_events(left_events, right_events, join_field, window_sec)
     results: list[JoinResult] = []
-    left_sorted = sorted(left_events, key=lambda e: e["event_time"])
-    right_sorted = sorted(right_events, key=lambda e: e["event_time"])
-    left_dict: dict[str, dict[str, Any]] = {}
-    for le in left_sorted:
-        key = str(le.get("payload", {}).get(join_field, ""))
-        left_dict[key] = le
-    right_dict: dict[str, dict[str, Any]] = {}
-    for re in right_sorted:
-        key = str(re.get("payload", {}).get(join_field, ""))
-        right_dict[key] = re
-    all_keys = set(left_dict.keys()) | set(right_dict.keys())
-    for key in all_keys:
-        lr = left_dict.get(key)
-        rr = right_dict.get(key)
-        ts = max(
-            lr.get("event_time", 0) if lr else 0,
-            rr.get("event_time", 0) if rr else 0,
-        )
-        results.append(JoinResult(
-            left_key=key,
-            right_key=key,
-            matched=(lr is not None and rr is not None),
-            window_start=ts,
-            window_end=ts + window_sec,
-            left_record=lr if lr else {},
-            right_record=rr if join_type != "left_only" else None,
-        ))
+    for group in groups:
+        left = group["left_events"]
+        right = group["right_events"]
+        ws, we = group["window_start"], group["window_end"]
+        if left and right:
+            results.append(JoinResult(
+                left_key=group["key"],
+                right_key=group["key"],
+                matched=True,
+                window_start=ws,
+                window_end=we,
+                left_record=left[0],
+                right_record=right[0],
+                left_events=list(left),
+                right_events=list(right),
+                pair_count=len(left) * len(right),
+            ))
+        elif join_type in ("left", "left_outer", "left_only") and left:
+            results.append(JoinResult(
+                left_key=group["key"], right_key=group["key"], matched=False,
+                window_start=ws, window_end=we,
+                left_record=left[0], right_record=None,
+                left_events=list(left),
+            ))
+        elif join_type in ("right", "right_outer") and right:
+            results.append(JoinResult(
+                left_key=group["key"], right_key=group["key"], matched=False,
+                window_start=ws, window_end=we,
+                left_record={}, right_record=right[0],
+                right_events=list(right),
+            ))
+    results.sort(key=lambda jr: (jr.window_start, jr.left_key))
     return results
 
 
@@ -297,25 +326,85 @@ def aggregate_and_sink_join_results(
     join_results: list[JoinResult],
     sink_task_name: str,
 ) -> dict[str, Any]:
-    """将双流关联结果聚合后写入落库任务。"""
-    matched = sum(1 for jr in join_results if jr.matched)
-    unmatched = len(join_results) - matched
-    agg_entry = {
-        "task_name": sink_task_name,
-        "join_total": len(join_results),
+    """将双流关联结果聚合后写入落库任务。
+
+    聚合口径与关联结果数据一致：按"窗口 + 关联键"统计键数，每条参与
+    关联的事件都计入事件数。同一批结果重复执行只刷新同一条落库记录，不追加。
+    """
+    groups: dict[tuple[float, float, str], dict[str, Any]] = {}
+    for jr in join_results:
+        gk = (jr.window_start, jr.window_end, jr.left_key)
+        slot = groups.setdefault(gk, {
+            "window_start": jr.window_start,
+            "window_end": jr.window_end,
+            "key": jr.left_key,
+            "matched": False,
+            "left_events": 0,
+            "right_events": 0,
+        })
+        slot["left_events"] = max(slot["left_events"], len(jr.left_events))
+        slot["right_events"] = max(slot["right_events"], len(jr.right_events))
+        slot["matched"] = slot["matched"] or jr.matched
+
+    matched = sum(1 for g in groups.values() if g["matched"])
+    unmatched = len(groups) - matched
+    event_count = sum(g["left_events"] + g["right_events"] for g in groups.values())
+
+    dedupe_raw = "|".join([
+        sink_task_name,
+        *sorted(
+            f"{int(g['window_start'])}-{int(g['window_end'])}:{g['key']}"
+            f":{g['left_events']}:{g['right_events']}"
+            for g in groups.values()
+        ),
+    ])
+    dedupe_key = hashlib.md5(dedupe_raw.encode()).hexdigest()[:16]
+
+    agg_rows = store.rows("aggregate_sink")
+    agg_entry = None
+    for row in agg_rows:
+        if row.get("任务名称") == sink_task_name:
+            agg_entry = row
+            break
+    if agg_entry is None:
+        for row in agg_rows:
+            if row.get("_join_dedupe_key") == dedupe_key:
+                agg_entry = row
+                break
+    payload = {
+        "join_total": len(groups),
+        "key_count": len(groups),
+        "event_count": event_count,
         "matched": matched,
         "unmatched": unmatched,
-        "match_rate": matched / max(len(join_results), 1),
-        "timestamp": time.time(),
+        "match_rate": matched / max(len(groups), 1),
+        "join_updated_at": time.time(),
+        "_join_dedupe_key": dedupe_key,
     }
-    agg_rows = store.rows("aggregate_sink")
-    agg_rows.append(agg_entry)
-    # 更新对应聚合任务状态
-    for row in store.rows("aggregate_sink"):
-        if row.get("任务名称") == sink_task_name and row.get("status") == "待启动":
-            row["status"] = "运行中"
-            row["pending"] = True
-            break
+    if agg_entry is None:
+        agg_entry = {
+            "id": max(
+                (int(r.get("id", 0)) for r in agg_rows), default=0
+            ) + 1,
+            "任务名称": sink_task_name,
+            "源指标集": "join_stream",
+            "聚合粒度": "window",
+            "输出表名": f"table_{sink_task_name}",
+            "落库频率": "60",
+            "覆盖模式": "append",
+            "分区键": "key",
+            "status": "运行中",
+            "pending": True,
+            "abnormal": False,
+            **payload,
+        }
+        agg_rows.append(agg_entry)
+    else:
+        # 同一批结果重复落库：只刷新统计，不新增记录
+        agg_entry.update(payload)
+        if agg_entry.get("status") == "待启动":
+            agg_entry["status"] = "运行中"
+            agg_entry["pending"] = True
     return agg_entry
 
 
@@ -323,8 +412,37 @@ def create_checkpoint_snapshot(
     operator_name: str,
     state: dict[str, Any],
     checkpoint_interval_sec: float = 30.0,
+    *,
+    join_name: str | None = None,
+    result_version: int | None = None,
 ) -> CheckpointSnapshot:
-    """创建算子状态检查点快照。"""
+    """创建算子状态检查点快照。
+
+    引用关联结果时先核对键数、事件数和窗口边界，只保存完整版本的引用。
+    """
+    reference = None
+    if join_name is not None:
+        from app.services.checkpoint_mgr import CheckpointMgrService
+        checker = CheckpointMgrService()
+        if result_version is None:
+            result_version = checker._latest_join_version(join_name)
+        check = checker.verify_join_reference(join_name, result_version)
+        if not check["ok"]:
+            raise ValueError(
+                "关联结果数据不完整，拒绝创建检查点：" + "；".join(check["issues"])
+            )
+        actual = check["actual"]
+        reference = {
+            "join_name": join_name,
+            "result_version": actual["result_version"],
+            "key_count": actual["key_count"],
+            "event_count": actual["event_count"],
+            "matched": actual["matched"],
+            "windows": actual["windows"],
+        }
+        state = dict(state)
+        state["join_reference"] = reference
+
     cp_id = hashlib.md5(f"{operator_name}_{time.time()}".encode()).hexdigest()[:12]
     snapshot = CheckpointSnapshot(
         checkpoint_id=cp_id,
@@ -332,7 +450,7 @@ def create_checkpoint_snapshot(
         operator_states={operator_name: copy.deepcopy(state)},
     )
     cp_rows = store.rows("checkpoint_mgr")
-    cp_rows.append({
+    row = {
         "id": cp_id,
         "operator": operator_name,
         "state": snapshot.operator_states,
@@ -340,7 +458,16 @@ def create_checkpoint_snapshot(
         "status": "已启用",
         "pending": False,
         "abnormal": False,
-    })
+    }
+    if reference is not None:
+        row.update({
+            "join_reference": reference,
+            "result_version": reference["result_version"],
+            "key_count": reference["key_count"],
+            "event_count": reference["event_count"],
+            "windows": reference["windows"],
+        })
+    cp_rows.append(row)
     return snapshot
 
 
@@ -657,13 +784,30 @@ def run_end_to_end_pipeline(
     if join_left_source and join_right_source:
         left_events = simulate_stream_batch(join_left_source, batch_size=10)
         right_events = simulate_stream_batch(join_right_source, batch_size=10)
-        join_results = perform_stream_join(
-            left_events, right_events, "user_id", 15.0, "inner",
+        from app.services.join_stream import JoinStreamService
+
+        join_service = JoinStreamService()
+        join_cfg = join_service._find_config("流关联样例1") or {}
+        join_name = join_cfg.get("配置名称") or "流关联样例1"
+        evaluated = join_service.evaluate_join_window(
+            join_name, left_events, right_events,
+            join_field="user_id", window_sec=15.0, join_type="inner",
         )
-        agg_result = aggregate_and_sink_join_results(join_results, "聚合落库样例1")
-        cp = create_checkpoint_snapshot("join_stream_agg", agg_result)
+        agg_result = aggregate_and_sink_join_results(
+            perform_stream_join(left_events, right_events, "user_id", 15.0, "inner"),
+            "聚合落库样例1",
+        )
+        cp = create_checkpoint_snapshot(
+            "join_stream_agg", agg_result,
+            join_name=join_name, result_version=evaluated.get("result_version"),
+        )
         report["chain3_join_checkpoint"] = {
-            "join_total": len(join_results),
+            "join_total": agg_result["join_total"],
+            "result_version": evaluated.get("result_version"),
+            "key_count": evaluated.get("key_count", agg_result["key_count"]),
+            "event_count": evaluated.get("event_count", agg_result["event_count"]),
+            "aggregate_key_count": agg_result["key_count"],
+            "aggregate_event_count": agg_result["event_count"],
             "matched": agg_result["matched"],
             "checkpoint_id": cp.checkpoint_id,
         }

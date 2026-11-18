@@ -21,6 +21,8 @@ class BaseModuleService:
         filters: dict[str, str] | None = None,
         keyword: str | None = None,
         status: str | None = None,
+        sort: str | None = None,
+        order: str = "asc",
         page: int = 1,
         size: int = 20,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -36,6 +38,16 @@ class BaseModuleService:
             rows = [row for row in rows if keyword.casefold() in str(row.get(field, "")).casefold()]
         if status:
             rows = [row for row in rows if row.get("status") == status]
+        if sort and sort in self.LIST_FIELDS:
+            rows.sort(
+                key=lambda row: str(row.get(sort, "")).casefold(),
+                reverse=str(order).lower() == "desc",
+            )
+        elif sort == "id":
+            rows.sort(
+                key=lambda row: int(row.get("id", 0)),
+                reverse=str(order).lower() == "desc",
+            )
         total = len(rows)
         start = (page - 1) * size
         return rows[start:start + size], total

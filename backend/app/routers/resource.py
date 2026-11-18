@@ -27,6 +27,8 @@ def list_entries(
     request: Request,
     keyword: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    sort: str | None = Query(default=None),
+    order: str = Query(default="asc"),
     page: int = Query(default=1, ge=1),
     size: int = Query(default=20, ge=1, le=200),
 ) -> PageResult[dict]:
@@ -37,7 +39,8 @@ def list_entries(
         if key in service.LIST_FIELDS and value.strip()
     }
     items, total = service.list_entries(
-        filters=filters, keyword=keyword, status=status, page=page, size=size)
+        filters=filters, keyword=keyword, status=status,
+        sort=sort, order=order, page=page, size=size)
     return PageResult(items=items, total=total, page=page, size=size)
 
 
@@ -47,6 +50,8 @@ def export_entries(
     request: Request,
     keyword: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    sort: str | None = Query(default=None),
+    order: str = Query(default="asc"),
 ) -> StreamingResponse:
     service = require_service(module)
     filters = {
@@ -55,7 +60,8 @@ def export_entries(
         if key in service.LIST_FIELDS and value.strip()
     }
     items, _ = service.list_entries(
-        filters=filters, keyword=keyword, status=status, page=1, size=1_000_000)
+        filters=filters, keyword=keyword, status=status,
+        sort=sort, order=order, page=1, size=1_000_000)
     output = io.StringIO()
     output.write("\ufeff")
     writer = csv.writer(output, lineterminator="\n")

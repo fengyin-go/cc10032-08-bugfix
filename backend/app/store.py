@@ -7,11 +7,19 @@
 from __future__ import annotations
 
 import copy
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 from app.seed import SEED_ROWS
+
+# 内部派生表：由流关联/检查点链路生成，不作为独立业务模块出现在导航和概览里。
+INTERNAL_TABLES = frozenset({
+    "join_result",
+    "join_result_version",
+})
 
 
 @dataclass
@@ -89,6 +97,10 @@ class Store:
         self._channels: dict[str, DataChannelEvent] = {}
         # 失败恢复记录：recovery_id → FailureRecovery
         self._failures: dict[str, FailureRecovery] = {}
+        # 关联结果版本序号：同一关联配置每产生一个新版本递增，供检查点引用
+        self._join_versions: dict[str, int] = {}
+        # 写事务锁：多个并发请求同时重算关联/保存检查点时串行化读-改-写
+        self._write_lock = threading.RLock()
 
     # ---- 跨模块数据通道 ----
 
@@ -217,15 +229,55 @@ class Store:
     # ---- 基础 CRUD ----
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        return sorted(name for name in self._tables if name not in INTERNAL_TABLES)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
 
-    def find(self, module: str, entry_id: int) -> dict[str, Any] | None:
+    def next_join_version(self, join_name: str) -> int:
+        """为一次流关联聚合分配新的结果版本号（按关联配置递增）。"""
+        version = self._join_versions.get(join_name, 0) + 1
+        self._join_versions[join_name] = version
+        return version
+
+    # ---- 事务快照 / 回滚 ----
+
+    @contextmanager
+    def locked(self) -> Iterator["Store"]:
+        """只读一致视图：与写事务互斥，读到的是某一时刻的完整结果。"""
+        with self._write_lock:
+            yield self
+
+    @contextmanager
+    def transaction(self) -> Iterator["Store"]:
+        """在整表快照上执行一段写操作；异常时回滚到事务前状态。
+
+        所有业务表（含内部派生表）一起快照，保证关联结果、版本索引和
+        检查点引用要么一起生效、要么一起恢复原记录。事务期间持有写锁，
+        并发的关联重算和检查点保存只能串行看到彼此的结果。
+        """
+        with self._write_lock:
+            backup: dict[str, list[dict[str, Any]]] = {
+                name: copy.deepcopy(rows) for name, rows in self._tables.items()
+            }
+            version_backup = dict(self._join_versions)
+            try:
+                yield self
+            except Exception:
+                self._tables = backup
+                self._join_versions = version_backup
+                raise
+
+    def find(self, module: str, entry_id: int | str) -> dict[str, Any] | None:
+        """按 id 查找；快照记录的 id 可能不是数字，匹配不上时按原值比较。"""
         for row in self.rows(module):
-            if int(row.get("id", 0)) == entry_id:
-                return row
+            row_id = row.get("id", 0)
+            try:
+                if int(row_id) == int(entry_id):
+                    return row
+            except (TypeError, ValueError):
+                if str(row_id) == str(entry_id):
+                    return row
         return None
 
     def overview(self) -> dict[str, object]:

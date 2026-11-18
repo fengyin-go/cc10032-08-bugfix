@@ -217,17 +217,23 @@ class TestJoinWindowSemantics:
     """验证双流时间窗口关联和语义正确性。"""
 
     def test_inner_join_matching(self):
-        """内联：只有两边都匹配的记录才产生结果。"""
+        """内联：只有两边都匹配的记录才产生结果。
+
+        结果按「窗口 + 关联键」拆分，同一关联键跨窗口可能产生多个匹配组；
+        但每个匹配组的键都必须同时出现在左右流的去重键集合里。
+        """
         left = _make_events(10)
         right = _make_events(10, base_ts=time.time() + 5)
         results = perform_stream_join(left, right, "user_id", 30.0, "inner")
-        matched = sum(1 for jr in results if jr.matched)
-        assert matched > 0
-        assert matched <= min(len(set(
-            str(e["payload"]["user_id"]) for e in left
-        )), len(set(
-            str(e["payload"]["user_id"]) for e in right
-        )))
+        matched_keys = {jr.left_key for jr in results if jr.matched}
+        assert matched_keys, "应至少有一个键在两侧都出现"
+        left_keys = {str(e["payload"]["user_id"]) for e in left}
+        right_keys = {str(e["payload"]["user_id"]) for e in right}
+        assert matched_keys <= left_keys
+        assert matched_keys <= right_keys
+        # 每个窗口+键只落一条结果，不因同键多事件重复计数
+        groups = [(jr.window_start, jr.left_key) for jr in results]
+        assert len(groups) == len(set(groups))
 
     def test_join_result_window_bounds(self):
         """关联结果应有正确的时间窗口边界。"""

@@ -77,7 +77,29 @@ npm run dev
 - 每个模块仍保留独立`backend/app/services/<模块>.py`；纯前端保留
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
+- 列表支持 `keyword`、`status`、`sort`、`order`、`page`、`size`，页面会把当前筛选
+  条件写进地址栏，跨页面返回时保持同一结果。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 序号8：流关联结果与检查点
+
+- 双流关联按「窗口 + 关联键」分组，同一关联键在同一窗口内的**所有**合格事件都参与
+  匹配与聚合；事件按事件时间对齐到窗口桶，同一关联键跨窗口会拆成独立窗口结果。
+- 关联结果数据落在内部表 `join_result`，每次聚合分配单调递增的 `result_version`；
+  同一批事件重复执行复用同一版本，记录数不变。旧版本保留，供检查点继续引用。
+- 检查点快照只保存对结果版本的引用，保存前核对键数、事件数和窗口边界；
+  引用对不上（只覆盖部分事件）时拒绝保存快照，恢复时也会校验失败。
+- 专用接口：
+  - `GET /api/join_stream/results?join_name=&window_key=&result_version=&page=&size=`
+  - `GET /api/join_stream/result-versions?join_name=`
+  - `GET /api/join_stream/{id}/results`
+  - `POST /api/join_stream/{id}/evaluate?window_key=&window_sec=&batch_size=&base_ts=`
+  - `GET /api/checkpoint_mgr/snapshots?join_name=&result_version=&page=&size=`
+  - `GET /api/checkpoint_mgr/snapshots/{checkpoint_id}`
+  - `POST /api/checkpoint_mgr/snapshots?config_name=&join_name=&result_version=`
+- 前端 `JoinResultPanel`（流关联页）与 `CheckpointSnapshotPanel`（检查点页）用同一组
+  `join_name` / `result_version` 筛选参数互相定位，检查点页可翻页查看每个快照引用
+  的版本、键数、事件数和窗口边界。
 
 领域：数据工程
 子方向：数据分析与数据应用
